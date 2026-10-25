@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂辅助工具
 // @namespace    local.yuketang.video-helper
-// @version      1.2.7
+// @version      1.2.9
 // @description  雨课堂课程学习助手，支持视频续播、作业处理与模型 API 设置。
 // @match        https://www.yuketang.cn/ai-workspace/*
 // @match        https://*.yuketang.cn/ai-workspace/*
@@ -57,9 +57,13 @@
   const HW_CONFIG_KEY = 'homework-api-v1';
   const HW_RENDER_QUIET_MS = 1500, HW_RENDER_TIMEOUT_MS = 25000;
   const HW_CONFIRM_QUIET_MS = 600, HW_ANSWER_POLL_MS = 200;
-  const HW_DEFAULTS = { endpoint: 'https://api.openai.com/v1/chat/completions', model: '', key: '', remember: false, vision: true, autoSubmit: true, confidence: 0.7 };
+  const HW_DEFAULTS = { endpoint: 'https://api.openai.com/v1/chat/completions', model: '', key: '', remember: false, autoSubmit: true, confidence: 0.7 };
   function loadHomeworkConfig() {
-    try { return { ...HW_DEFAULTS, ...GM_getValue(HW_CONFIG_KEY, {}) }; }
+    try {
+      const config = { ...HW_DEFAULTS, ...GM_getValue(HW_CONFIG_KEY, {}) };
+      delete config.vision; // 兼容旧设置；题图现在始终启用。
+      return config;
+    }
     catch { return { ...HW_DEFAULTS }; }
   }
   const H = {
@@ -68,8 +72,10 @@
     confirmed: new Set(), cache: new Map(), answered: 0, completed: 0,
     pending: '', submittedAt: 0, previewURL: '', answerTrace: null, status: '就绪', level: '',
     readiness: null, questionWaitAt: 0, confirmation: null, completionProof: '', finalConfirmed: false,
-    skipped: new Map(), deferred: new Set(),
+    skipped: new Map(), deferred: new Set(), autoFlow: false,
   };
+  const FLOW = { enabled: false, course: S.course };
+  const CONTROL = { mode: S.running && saved.get(S.course + ':study') !== 'on' ? 'watch' : 'combined' };
   const MODES = { owner: S.running ? 'watch' : '', last: 'watch' };
   function modeRunning(mode) { return mode === 'watch' ? S.running : mode === 'homework' ? H.running : false; }
   function activeMode() {
@@ -96,7 +102,15 @@
     if (doc && (homeworkDocument() !== doc || questionSnapshot(doc)?.signature !== signature)) throw new Error('题目已变化，已取消旧答案。');
   }
   function stopHomework(message = '答题已暂停。', level = '') {
+    const automatic = H.running && H.autoFlow;
+    const ownedPage = MODES.owner === 'homework';
     H.running = false;
+    H.autoFlow = false;
+    if (automatic && S.running) {
+      // 保留视频任务；本轮不再自动开启答题，直到用户重新启用。
+      FLOW.enabled = false; saved.set(S.course + ':study', 'off');
+      if (ownedPage) { S.phase = 'select'; S.target = null; S.since = Date.now(); }
+    }
     H.generation++;
     H.phase = 'idle';
     H.busy = false;
@@ -116,6 +130,90 @@
     if (!url.pathname.endsWith('/chat/completions')) url.pathname += '/chat/completions';
     return url.href;
   }
+  function homeworkApiReady() {
+    if (typeof GM_xmlhttpRequest !== 'function' || !H.config.key.trim() || !H.config.model.trim()) return false;
+    try { apiEndpoint(H.config.endpoint); return true; } catch { return false; }
+  }
+  function prepareAutomaticHomework(course) {
+    if (H.running) { H.autoFlow = true; return; }
+    if (H.course !== course) { H.confirmed.clear(); H.cache.clear(); H.answered = 0; H.completed = 0; }
+    H.course = course; H.skipped.clear(); H.deferred.clear(); H.confirmation = null; H.finalConfirmed = false;
+    H.running = true; H.autoFlow = true; H.phase = 'queued'; H.target = null; H.route = '';
+    H.pending = ''; H.navigatingTo = ''; H.since = Date.now(); H.level = '';
+    H.status = '自动答题已启用，等待目录中的作业。';
+  }
+  function configureStudyFlow(course) {
+    FLOW.course = course; FLOW.enabled = H.running && homeworkApiReady();
+    saved.set(course + ':study', FLOW.enabled ? 'on' : 'off');
+    if (FLOW.enabled) prepareAutomaticHomework(course);
+  }
+  function startAll() {
+    MODES.last = 'homework';
+    if (!courseId()) { tellHomework('请先打开有完整章节目录的课程。', 'warn'); return; }
+    if (!homeworkApiReady()) {
+      tellHomework('请先在 API 设置中填写并保存 API Key、模型名称和有效地址，再启动观看并答题。', 'warn');
+      showHomeworkSettings(); return;
+    }
+    H.config.endpoint = apiEndpoint(H.config.endpoint);
+    prepareAutomaticHomework(courseId()); start();
+  }
+  function stopAll() {
+    H.autoFlow = false; FLOW.enabled = false;
+    stopHomework('答题已暂停。'); stop('所有任务已暂停。');
+  }
+  function setRunMode(mode) {
+    if (S.running || H.running) { render(); return; }
+    if (!['combined', 'watch', 'homework'].includes(mode) || CONTROL.mode === mode) return;
+    stopAll(); CONTROL.mode = mode;
+    const label = { combined: '观看并答题', watch: '只观看', homework: '只答题' }[mode];
+    tell(`已选择${label}，点击开始运行。`);
+  }
+  function toggleSelectedMode() {
+    if (S.running || H.running) { stopAll(); return; }
+    if (CONTROL.mode === 'combined') startAll();
+    else if (CONTROL.mode === 'watch') start();
+    else startHomework();
+  }
+  function pauseStudyWatching() {
+    FLOW.enabled = false; saved.set(S.course + ':study', 'off');
+    if (H.autoFlow) {
+      H.autoFlow = false;
+      if (H.phase === 'queued') { H.phase = 'select'; H.target = null; H.route = ''; H.since = Date.now(); }
+    }
+  }
+  function parkAutomaticHomework(message) {
+    if (!H.autoFlow || !S.running || !FLOW.enabled) return false;
+    H.phase = 'queued'; H.target = null; H.route = ''; H.pending = ''; H.confirmation = null;
+    resetHomeworkReadiness(); releaseMode('homework'); MODES.owner = 'watch';
+    S.phase = 'select'; S.target = null; S.since = Date.now();
+    H.status = '自动答题已启用，等待目录中的下一份作业。'; H.level = '';
+    tell(message || '作业处理已结束，继续目录中的视频和作业…'); return true;
+  }
+  function selectStudyHomework(entries, now) {
+    if (!FLOW.enabled || !H.running || !H.autoFlow) return false;
+    if (!homeworkApiReady()) { stopHomework('API 配置不可用，本轮继续观看视频。', 'warn'); return false; }
+    const next = entries.find(entry => !entry.done && !entry.locked && (entry.isVideo
+      ? !S.confirmed.has(entry.key) : entry.isHomework && !H.confirmed.has(entry.key) && !H.deferred.has(entry.key)));
+    if (!next) {
+      const skipped = H.skipped.size ? `另有 ${H.skipped.size} 题需结合视频，保留未作答。` : '';
+      H.autoFlow = false; stopHomework(null);
+      stop(`本轮视频和可处理作业已结束；作业完成 ${H.completed} 份，提交 ${H.answered} 题。${skipped}`);
+      return true;
+    }
+    if (next.isVideo) return false;
+    H.target = { key: next.key, title: next.title }; H.phase = 'load'; H.since = now; H.route = '';
+    H.finalConfirmed = false; H.completionProof = ''; H.confirmation = null; resetHomeworkReadiness();
+    MODES.owner = 'homework'; S.target = null;
+    tellHomework(`准备答题：${next.title}`);
+    if (!next.active) next.el.click();
+    return true;
+  }
+  if (S.running && saved.get(S.course + ':study') === 'on' && homeworkApiReady()) {
+    FLOW.enabled = true; prepareAutomaticHomework(S.course);
+  } else if (S.running && saved.get(S.course + ':study') === 'on') {
+    S.running = false; S.phase = 'idle'; saved.set(S.course, 'off');
+    S.status = '联合模式需要完整 API 配置，请填写后点击开始。'; S.level = 'warn';
+  }
   function startHomework() {
     if (H.running) return;
     MODES.last = 'homework';
@@ -130,8 +228,12 @@
     H.skipped.clear(); H.deferred.clear(); H.confirmation = null; H.finalConfirmed = false;
     H.course = courseId(); H.target = null; H.route = ''; H.phase = 'select';
     H.running = true; H.since = Date.now(); H.pending = ''; H.navigatingTo = '';
+    if (S.running) {
+      FLOW.enabled = true; FLOW.course = H.course; saved.set(H.course + ':study', 'on');
+      H.autoFlow = true; H.phase = 'queued';
+    } else H.autoFlow = false;
     const ownsPage = claimMode('homework');
-    tellHomework(ownsPage ? '正在查找最早未完成的作业…' : '等待观看任务结束后答题。');
+    tellHomework(ownsPage && !H.autoFlow ? '正在查找最早未完成的作业…' : '自动答题已启用，当前视频结束后按目录处理作业。');
     startWorker(); safeStep();
   }
   function displayed(el) {
@@ -376,6 +478,7 @@
     });
   }
   function buildQuestionPayload(q, image) {
+    if (typeof image !== 'string' || !image.startsWith('data:image/')) throw new Error('没有有效题图，已暂停；不会使用文字代替图片。');
     const kind = { single: '单选题', multiple: '多选题', judge: '判断题', blank: '填空题', text: '简答题' }[q.kind] || '未知题型';
     const metadata = `当前题型：${kind}。可用选项标识：${q.options.map(o => o.letter).join('/')}。输入框数：${q.fields.length}。`;
     const instructions = [
@@ -387,10 +490,9 @@
       '若确实缺少这类课程上下文，只返回 {"action":"skip","reason":"missing_course_context","answers":[],"confidence":0}。即使某个选项看似合理也应跳过。',
       '仅出现“本讲”“本课程”但题目本身可用完整题干、图表或通用知识解答时，正常解答。普通知识不确定、图片不清或无法识别时返回空 answers；不要将这些情况伪装成缺少视频上下文。',
     ].join('');
-    const content = image ? [{ type: 'image_url', image_url: { url: image } }]
-      : `题干：${q.text}\n选项：${q.options.map(o => o.letter + ': ' + o.text).join('\n')}`;
+    const content = [{ type: 'image_url', image_url: { url: image } }];
     return { model: H.config.model.trim(), max_tokens: 2048, messages: [
-      { role: 'system', content: instructions + metadata + (image ? '题干及选项仅在题图中，请直接依据图像解答。' : '') },
+      { role: 'system', content: instructions + metadata + '题干及选项仅在题图中，请直接依据图像解答。' },
       { role: 'user', content },
     ] };
   }
@@ -398,8 +500,7 @@
     if (q.kind === 'unsupported' || (['single', 'multiple', 'judge'].includes(q.kind) && (!q.options.length || q.options.some(o => !o.input || o.input.disabled)))) throw new Error('此题的选项或题型未识别，请手动处理。');
     if (q.kind === 'judge' && (q.options.length !== 2 || q.options.some(option => typeof option.truth !== 'boolean') || new Set(q.options.map(option => option.truth)).size !== 2)) throw new Error('判断题正误选项含义未识别，请手动处理。');
     if (['blank', 'text'].includes(q.kind) && !q.fields.length) throw new Error('此题使用富文本、附件或未知编辑器，请手动处理后继续。');
-    if (q.encrypted && !H.config.vision) throw new Error('此题有字体混淆，请在 API 设置中启用题图，并使用支持图片的模型。');
-    const image = H.config.vision ? await captureQuestion(q) : null;
+    const image = await captureQuestion(q);
     assertHomework(token, q.root.ownerDocument, q.signature);
     const payload = buildQuestionPayload(q, image);
     for (let attempt = 0; ; attempt++) {
@@ -490,10 +591,14 @@
   async function homeworkStep() {
     if (!H.running) return;
     const now = Date.now();
+    if (H.phase === 'queued') {
+      if (S.running && FLOW.enabled) { MODES.owner = 'watch'; return; }
+      H.autoFlow = false; H.phase = 'select'; H.since = now;
+    }
     if (H.course !== courseId()) { stopHomework('已离开当前课程，答题已暂停。'); return; }
     if (new URL(location.href).searchParams.get('is_chapter') !== '1') {
       const url = new URL(location.href); url.searchParams.set('is_chapter', '1');
-      stopHomework('正在恢复完整目录；页面加载后请再次点击“开始答题”。'); location.replace(url.href); return;
+      stopHomework('正在恢复完整目录；页面加载后请再次点击“开始”。'); location.replace(url.href); return;
     }
     if (expandDirectory(now)) return;
     const entries = scan();
@@ -530,7 +635,9 @@
     if (H.phase === 'complete') {
       if (!H.finalConfirmed && homeworkCardProof(doc) !== H.completionProof) { stopHomework('题号列表的提交状态发生变化，已暂停，请检查后继续。', 'warn'); return; }
       if (now - H.since < 3000) return;
-      H.confirmed.add(H.target.key); H.completed++; H.phase = 'select'; H.since = now;
+      H.confirmed.add(H.target.key); H.completed++;
+      if (parkAutomaticHomework('作业提交已确认，继续目录中的视频和作业…')) return;
+      H.phase = 'select'; H.since = now;
       tellHomework('本份作业所有题目均已提交，准备下一份…'); return;
     }
     if (H.phase === 'submitted') {
@@ -551,7 +658,9 @@
     if (!first) {
       const remaining = q.cards.filter(card => !cardSubmitted(card));
       if (remaining.length) {
-        H.deferred.add(H.target.key); H.phase = 'select'; H.since = now; resetHomeworkReadiness();
+        H.deferred.add(H.target.key);
+        if (parkAutomaticHomework(`本份作业有 ${remaining.length} 题需课程视频内容，保留未作答，继续后续内容…`)) return;
+        H.phase = 'select'; H.since = now; resetHomeworkReadiness();
         tellHomework(`本份作业有 ${remaining.length} 题缺少课程视频内容，保留未作答，继续下一份…`); return;
       }
       const finalButton = homeworkButtons(doc, /^(提交作业|完成作业)$/).find(el => !el.disabled);
@@ -582,7 +691,7 @@
     resetHomeworkReadiness();
     H.answerTrace = { assignment: H.target.title, question: q.number, kind: q.kind, source: H.cache.has(cacheKey) ? '缓存' : '模型', modelReply: null, answers: [], selected: [], status: '等待答案', startedAt: new Date(now).toISOString() };
     try {
-      tellHomework(`正在解答：${H.target.title} · 第 ${q.number}/${q.cards.length} 题${H.config.vision ? '（题图模式）' : ''}`);
+      tellHomework(`正在解答：${H.target.title} · 第 ${q.number}/${q.cards.length} 题`);
       const answers = H.cache.get(cacheKey) || await solveQuestion(q, token);
       assertHomework(token, doc, q.signature);
       if (answers.skip) {
@@ -594,7 +703,11 @@
       H.cache.set(cacheKey, answers);
       await fillQuestion(q, answers, token);
       assertHomework(token, doc, q.signature);
-      if (!H.config.autoSubmit) { H.answerTrace.status = '已填写，等待人工提交'; stopHomework(`第 ${q.number} 题已填写。请检查并手动提交，再点击“开始答题”继续。`); return; }
+      if (!H.config.autoSubmit) {
+        H.answerTrace.status = '已填写，等待人工提交';
+        if (H.autoFlow && S.running) stop('当前题已填写待人工提交，观看已暂停。');
+        stopHomework(`第 ${q.number} 题已填写。请检查并手动提交，再点击开始继续。`); return;
+      }
       H.answerTrace.status = '提交前再次核对答案和按钮';
       const currentSubmit = await verifyHomeworkAnswers(q, answers, token, true);
       assertHomework(token, doc, q.signature);
@@ -612,7 +725,7 @@
     if (!box) return;
     box.hidden = false;
     for (const key of ['endpoint', 'model', 'key', 'confidence']) box.querySelector(`[name=${key}]`).value = H.config[key];
-    for (const key of ['remember', 'vision', 'autoSubmit']) box.querySelector(`[name=${key}]`).checked = H.config[key];
+    for (const key of ['remember', 'autoSubmit']) box.querySelector(`[name=${key}]`).checked = H.config[key];
   }
   function saveHomeworkSettings() {
     const box = S.panel.querySelector('.ykt-api-settings');
@@ -622,11 +735,11 @@
       config.endpoint = apiEndpoint(config.endpoint);
       config.confidence = Number(box.querySelector('[name=confidence]').value);
       if (!config.model || !Number.isFinite(config.confidence) || config.confidence < 0 || config.confidence > 1) throw new Error('请填写模型名称，置信度需在 0 到 1 之间。');
-      for (const key of ['remember', 'vision', 'autoSubmit']) config[key] = box.querySelector(`[name=${key}]`).checked;
+      for (const key of ['remember', 'autoSubmit']) config[key] = box.querySelector(`[name=${key}]`).checked;
       stopHomework(null); H.cache.clear();
       GM_setValue(HW_CONFIG_KEY, { ...config, key: config.remember ? config.key : '' });
       H.config = config; box.hidden = true;
-      tellHomework(`API 设置已保存。${config.remember ? 'Key 保存在本脚本的篡改猴存储中。' : 'Key 仅保留至本标签页刷新。'} 点击“开始答题”开始。`);
+      tellHomework(`API 设置已保存。${config.remember ? 'Key 保存在本脚本的篡改猴存储中。' : 'Key 仅保留至本标签页刷新。'} 点击“开始”开始。`);
     } catch (error) { tellHomework(error.message || '设置保存失败。', 'warn'); }
   }
   async function previewHomework() {
@@ -722,8 +835,8 @@
     if (!root) return false;
     const search = root.querySelector('.nav-search input');
     if (search?.value) {
-      if (activeMode() === 'homework') stopHomework('请清空左侧目录搜索条件，再点击开始观看答题。', 'warn');
-      else stop('请清空左侧目录的搜索条件，再点击开始观看，以便从完整目录选择。', 'warn');
+      if (activeMode() === 'homework') stopHomework('请清空左侧目录搜索条件，再点击开始。', 'warn');
+      else stop('请清空左侧目录的搜索条件，再点击开始，以便从完整目录选择。', 'warn');
       return true;
     }
     const collapsed = [...root.querySelectorAll('.nav-item-title')].filter(el =>
@@ -887,11 +1000,12 @@
       } else if (error.name !== 'AbortError') {
         tell(`播放暂未恢复：${error.message || error.name}`, 'warn');
       }
-      if (S.needGesture) tell('播放器尚未开始播放。请恢复窗口并点击视频播放按钮，或先暂停助手再点击“开始观看”。', 'warn');
+      if (S.needGesture) tell('播放器尚未开始播放。请恢复窗口并点击视频播放按钮，或先暂停助手再点击“开始”。', 'warn');
     } finally { S.playing = false; }
   }
 
   function selectNext(entries, now) {
+    if (selectStudyHomework(entries, now)) return;
     const videos = entries.filter(entry => entry.isVideo);
     if (!videos.length) {
       if (now - S.since > NAV_WAIT_MS) stop('没有识别到视频。请打开带有完整左侧章节目录的页面。', 'warn');
@@ -1037,7 +1151,8 @@
     S.needGesture = false;
     saved.set(course, 'on');
     const ownsPage = claimMode('watch');
-    tell(ownsPage ? '正在准备观看…' : '等待答题任务结束后观看。');
+    configureStudyFlow(course);
+    tell(ownsPage ? (FLOW.enabled ? '正在准备观看与答题…' : '正在准备观看…') : '等待当前答题结束后继续观看。');
     startWorker();
     safeStep();
     if (S.phase === 'navigate') safeStep();
@@ -1046,6 +1161,7 @@
 
   function stop(message = '已暂停观看。', level = '') {
     const wasRunning = S.running;
+    pauseStudyWatching();
     S.running = false;
     S.phase = 'idle';
     saved.set(S.course, 'off');
@@ -1085,6 +1201,12 @@
       #ykt-sequential-video-helper .ykt-answer-trace,#ykt-sequential-video-helper .ykt-skipped-questions{white-space:pre-wrap;overflow-wrap:anywhere;max-height:220px;overflow:auto;font:12px/1.6 monospace}
       #ykt-sequential-video-helper .ykt-controls{display:flex;gap:8px;flex-wrap:nowrap}
       #ykt-sequential-video-helper .ykt-controls button{flex:1;min-width:0;white-space:nowrap;margin:0;padding:7px 8px}
+      #ykt-sequential-video-helper .ykt-heading{display:flex;align-items:center;justify-content:space-between}
+      #ykt-sequential-video-helper .ykt-heading button{background:transparent;color:#52647c;margin:0;padding:0 4px;font-size:19px}
+      #ykt-sequential-video-helper .ykt-controls select{flex:1;min-width:0;padding:7px 9px;border:1px solid #bbc6d5;border-radius:6px;background:white;color:#20304a;font:inherit}
+      #ykt-sequential-video-helper .ykt-controls button[data-action=toggle]{flex:0 0 56px}
+      #ykt-sequential-video-helper .ykt-controls button[data-action=settings]{flex:0 0 72px}
+      #ykt-sequential-video-helper .ykt-controls select[hidden]+button[data-action=toggle]{flex:1}
       #ykt-sequential-video-helper strong{font-size:15px}
       #ykt-sequential-video-helper p{margin:9px 0;overflow-wrap:anywhere}
       #ykt-sequential-video-helper .ykt-status[data-level=warn],#ykt-sequential-video-helper .ykt-homework-status[data-level=warn]{color:#a34b00}
@@ -1096,16 +1218,15 @@
     <p class="ykt-status" role="status"></p>
     <p class="ykt-homework-status" role="status" hidden></p>
     <p class="ykt-telemetry"></p>
-    <div class="ykt-controls"><button type="button" data-action="start" aria-pressed="false" title="从最早未完成视频的已保存位置继续">开始观看</button><button type="button" data-action="homework" aria-pressed="false">开始答题</button><button type="button" data-action="settings">API 设置</button></div>
+    <div class="ykt-controls"><select data-action="mode" aria-label="运行模式"><option value="combined">观看并答题</option><option value="watch">只观看</option><option value="homework">只答题</option></select><button type="button" data-action="toggle" aria-pressed="false">开始</button><button type="button" data-action="settings">API 设置</button></div>
     <div class="ykt-api-settings" hidden>
       <label>API 地址（兼容 Chat Completions）<input name="endpoint" type="url" autocomplete="off" placeholder="https://api.example.com/v1/chat/completions"></label>
       <label>模型名称<input name="model" type="text" autocomplete="off" placeholder="填写服务商提供的模型 ID"></label>
       <label>API Key<input name="key" type="password" autocomplete="off" spellcheck="false" placeholder="仅发送到你配置的 API 地址"></label>
       <label><input name="remember" type="checkbox"> 记住 Key（篡改猴脚本存储）</label>
-      <label><input name="vision" type="checkbox"> 发送题图（混淆字体须用支持图片的模型）</label>
       <label><input name="autoSubmit" type="checkbox"> 自动提交并继续下一份作业</label>
       <label>最低模型置信度（0–1）<input name="confidence" type="number" min="0" max="1" step="0.05"></label>
-      <small>API 按服务商规则计费。仅发送当前题目与选项；刷新后需手动启动答题。主观题暂支持普通文本框，附件及富文本题需手动处理。</small>
+      <small>题目始终以图片发送，需使用支持图片输入的多模态模型。API 按服务商规则计费；单独答题刷新后需重新启动；联合模式按保存的观看状态恢复。主观题暂支持普通文本框，附件及富文本题需手动处理。</small>
       <details><summary>本次跳过题目</summary><pre class="ykt-skipped-questions">暂无</pre></details>
       <details><summary>最近答题记录</summary><pre class="ykt-answer-trace">暂无记录</pre></details>
       <button type="button" data-action="save-api">保存设置</button><button type="button" data-action="preview">预览题图</button><button type="button" data-action="close-settings">关闭</button>
@@ -1113,14 +1234,14 @@
     <div class="ykt-preview" hidden><button type="button" data-action="close-preview">关闭题图</button><p>此图将发送给你配置的模型；预览不会调用 API。</p><img alt="当前作业题图预览"></div>`;
     panel.addEventListener('click', event => {
       const action = event.target.closest('button')?.dataset.action;
-      if (action === 'start') { if (S.running) stop(); else start(); }
-      if (action === 'homework') { if (H.running) stopHomework(); else startHomework(); }
+      if (action === 'toggle') toggleSelectedMode();
       if (action === 'settings') showHomeworkSettings();
       if (action === 'save-api') saveHomeworkSettings();
       if (action === 'close-settings') panel.querySelector('.ykt-api-settings').hidden = true;
       if (action === 'preview') void previewHomework();
       if (action === 'close-preview') { const preview = panel.querySelector('.ykt-preview'); preview.hidden = true; preview.querySelector('img').removeAttribute('src'); }
     });
+    panel.addEventListener('change', event => { if (event.target.matches('[data-action=mode]')) setRunMode(event.target.value); });
     document.body.appendChild(panel);
     S.panel = panel;
     render();
@@ -1151,14 +1272,15 @@
     if (trace) trace.textContent = H.answerTrace ? JSON.stringify(H.answerTrace, null, 2) : '暂无记录';
     const skipped = S.panel.querySelector('.ykt-skipped-questions');
     if (skipped) skipped.textContent = [...H.skipped.values()].map(item => `${item.assignment} · 第 ${item.question} 题：${item.reason}`).join('\n') || '暂无';
-    const watchButton = S.panel.querySelector('[data-action=start]');
-    watchButton.textContent = S.running ? '暂停观看' : '开始观看';
-    watchButton.setAttribute('aria-pressed', String(S.running));
-    watchButton.title = S.running ? '暂停观看' : '从最早未完成的视频继续观看';
-    const homeworkButton = S.panel.querySelector('[data-action=homework]');
-    homeworkButton.textContent = H.running ? '暂停答题' : '开始答题';
-    homeworkButton.setAttribute('aria-pressed', String(H.running));
-    homeworkButton.title = H.running ? '暂停答题并取消未完成请求' : '从最早未完成的作业开始答题';
+    const modeSelect = S.panel.querySelector('[data-action=mode]');
+    modeSelect.value = CONTROL.mode;
+    const running = S.running || H.running;
+    modeSelect.hidden = running;
+    modeSelect.disabled = running;
+    const button = S.panel.querySelector('[data-action=toggle]');
+    button.textContent = running ? '暂停' : '开始';
+    button.setAttribute('aria-pressed', String(running));
+    button.title = running ? '暂停当前任务并取消未完成的模型请求' : '按所选模式开始';
   }
 
   // 大型截图库由篡改猴作为 @resource 下载并缓存；主脚本不再内嵌超长压缩代码。
