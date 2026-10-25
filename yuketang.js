@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂辅助工具
 // @namespace    local.yuketang.video-helper
-// @version      1.2.11
+// @version      1.2.12
 // @description  雨课堂课程学习助手，支持视频续播、作业处理与模型 API 设置。
 // @match        https://www.yuketang.cn/ai-workspace/*
 // @match        https://*.yuketang.cn/ai-workspace/*
@@ -57,6 +57,7 @@
   const HW_CONFIG_KEY = 'homework-api-v1';
   const HW_RENDER_QUIET_MS = 1500, HW_RENDER_TIMEOUT_MS = 25000;
   const HW_CONFIRM_QUIET_MS = 600, HW_ANSWER_POLL_MS = 200;
+  const HW_QUESTION_DELAY_MIN_MS = 2500, HW_QUESTION_DELAY_MAX_MS = 3500;
   const HW_DEFAULTS = { endpoint: 'https://api.deepseek.com/v1/chat/completions', model: 'deepseek-flash', key: '', remember: false, autoSubmit: true, confidence: 0.7 };
   function loadHomeworkConfig() {
     try {
@@ -74,6 +75,7 @@
     pending: '', submittedAt: 0, previewURL: '', answerTrace: null, status: '就绪', level: '',
     readiness: null, questionWaitAt: 0, confirmation: null, completionProof: '', finalConfirmed: false,
     skipped: new Map(), deferred: new Set(), autoFlow: false,
+    nextQuestionAt: 0, questionDelayMs: 0, questionDelayTimer: null,
   };
   const FLOW = { enabled: false, course: S.course };
   const CONTROL = { mode: S.running && saved.get(S.course + ':study') !== 'on' ? 'watch' : 'combined' };
@@ -96,6 +98,26 @@
   function releaseMode(mode) { if (MODES.owner === mode) MODES.owner = ''; MODES.last = mode; }
   function tellHomework(message, level = '') { H.status = message; H.level = level; render(); }
   const waitHomework = ms => new Promise(resolve => setTimeout(resolve, ms));
+  function clearQuestionDelay() {
+    if (H.questionDelayTimer !== null) clearTimeout(H.questionDelayTimer);
+    H.questionDelayTimer = null; H.nextQuestionAt = 0; H.questionDelayMs = 0;
+  }
+  function queueQuestionDelay(now = Date.now()) {
+    clearQuestionDelay();
+    const delay = HW_QUESTION_DELAY_MIN_MS + Math.floor(Math.random() * (HW_QUESTION_DELAY_MAX_MS - HW_QUESTION_DELAY_MIN_MS + 1));
+    H.questionDelayMs = delay; H.nextQuestionAt = now + delay;
+    if (H.answerTrace) H.answerTrace.nextQuestionDelayMs = delay;
+    const token = H.generation;
+    H.questionDelayTimer = setTimeout(() => {
+      H.questionDelayTimer = null;
+      if (homeworkAlive(token)) safeStep();
+    }, delay);
+  }
+  function questionDelayPending(now) {
+    if (!H.nextQuestionAt) return false;
+    if (now < H.nextQuestionAt) return true;
+    clearQuestionDelay(); return false;
+  }
   function homeworkAlive(token) { return H.running && H.generation === token && H.course === courseId(); }
   function assertHomework(token, doc, signature) {
     if (pauseForVerification()) throw new Error('检测到人机验证，任务已暂停。');
@@ -111,6 +133,7 @@
     H.generation++;
     H.phase = 'idle';
     H.busy = false;
+    clearQuestionDelay();
     resetHomeworkReadiness();
     const abort = H.abort;
     H.abort = null;
@@ -160,7 +183,7 @@
   function haltTasks(message, level = 'warn') {
     const abort = H.abort;
     H.running = false; H.autoFlow = false; H.generation++; H.phase = 'idle'; H.busy = false;
-    H.abort = null; H.pending = ''; H.confirmation = null; resetHomeworkReadiness();
+    H.abort = null; H.pending = ''; H.confirmation = null; clearQuestionDelay(); resetHomeworkReadiness();
     S.running = false; S.phase = 'idle'; S.playing = false; S.needGesture = false;
     FLOW.enabled = false; MODES.owner = '';
     saved.set(S.course, 'off'); saved.set(S.course + ':study', 'off');
@@ -406,6 +429,7 @@
     if (!modelDecision) H.answerTrace = { assignment: H.target.title, question: q.number, kind: q.kind, source: '页面题型', modelReply: null, answers: [], selected: [] };
     H.answerTrace.status = '已跳过：' + reason + '，未填写、未提交';
     beginQuestionWait(q.root.ownerDocument);
+    queueQuestionDelay();
     tellHomework(`第 ${q.number} 题已跳过：${reason}，继续后续题目…`);
   }
   function normalizeChoiceAnswers(values, q) {
@@ -683,7 +707,8 @@
       if (confirmationStable(questionSubmissionEvidence(doc), now)) {
         H.answered++; H.phase = 'question'; H.pending = ''; beginQuestionWait(doc, now);
         if (H.answerTrace) { H.answerTrace.status = '页面已确认提交'; H.answerTrace.confirmedAt = new Date(now).toISOString(); }
-        tellHomework('页面已确认提交，等待下一题内容稳定…'); return;
+        queueQuestionDelay(now);
+        tellHomework('页面已确认提交，等待下一题作答…'); return;
       }
       if (now - H.submittedAt > 25000) stopHomework('提交后未收到页面确认，已暂停；请检查结果后继续，避免重复提交。', 'warn');
       return;
@@ -721,6 +746,7 @@
     }
     H.navigatingTo = '';
     if (q.submitted) { stopHomework('题号列表与提交状态不一致，请刷新后继续。', 'warn'); return; }
+    if (questionDelayPending(now)) { tellHomework('等待下一题作答…'); return; }
     const manualReason = manualQuestionReason(q);
     if (manualReason) { skipHomeworkQuestion(q, manualReason); return; }
     const submit = homeworkButtons(doc, /^提交$/)[0];
