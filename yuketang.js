@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂辅助工具
 // @namespace    local.yuketang.video-helper
-// @version      1.2.10
+// @version      1.2.11
 // @description  雨课堂课程学习助手，支持视频续播、作业处理与模型 API 设置。
 // @match        https://www.yuketang.cn/ai-workspace/*
 // @match        https://*.yuketang.cn/ai-workspace/*
@@ -98,20 +98,16 @@
   const waitHomework = ms => new Promise(resolve => setTimeout(resolve, ms));
   function homeworkAlive(token) { return H.running && H.generation === token && H.course === courseId(); }
   function assertHomework(token, doc, signature) {
+    if (pauseForVerification()) throw new Error('检测到人机验证，任务已暂停。');
     if (!homeworkAlive(token)) throw new Error('作业任务已暂停。');
     if (H.route !== location.pathname || !scan().some(e => e.active && e.key === H.target?.key)) throw new Error('页面已切换，已取消本次作答。');
     if (doc && (homeworkDocument() !== doc || questionSnapshot(doc)?.signature !== signature)) throw new Error('题目已变化，已取消旧答案。');
   }
   function stopHomework(message = '答题已暂停。', level = '') {
     const automatic = H.running && H.autoFlow;
-    const ownedPage = MODES.owner === 'homework';
+    if (level === 'warn' || automatic && S.running) { haltTasks(message || '任务已暂停，请手动处理后重新开始。', level); return; }
     H.running = false;
     H.autoFlow = false;
-    if (automatic && S.running) {
-      // 保留视频任务；本轮不再自动开启答题，直到用户重新启用。
-      FLOW.enabled = false; saved.set(S.course + ':study', 'off');
-      if (ownedPage) { S.phase = 'select'; S.target = null; S.since = Date.now(); }
-    }
     H.generation++;
     H.phase = 'idle';
     H.busy = false;
@@ -159,8 +155,25 @@
     prepareAutomaticHomework(courseId()); start();
   }
   function stopAll() {
-    H.autoFlow = false; FLOW.enabled = false;
-    stopHomework('答题已暂停。'); stop('所有任务已暂停。');
+    haltTasks('所有任务已暂停。', '');
+  }
+  function haltTasks(message, level = 'warn') {
+    const abort = H.abort;
+    H.running = false; H.autoFlow = false; H.generation++; H.phase = 'idle'; H.busy = false;
+    H.abort = null; H.pending = ''; H.confirmation = null; resetHomeworkReadiness();
+    S.running = false; S.phase = 'idle'; S.playing = false; S.needGesture = false;
+    FLOW.enabled = false; MODES.owner = '';
+    saved.set(S.course, 'off'); saved.set(S.course + ':study', 'off');
+    try { S.worker?.terminate(); } catch {}
+    S.worker = null;
+    try { abort?.(); } catch {}
+    try { S.video?.pause(); } catch {}
+    if (H.answerTrace && level) H.answerTrace.status = '已暂停：' + message;
+    H.status = message; S.status = message;
+    const homeworkOnly = CONTROL.mode === 'homework';
+    H.level = homeworkOnly ? level : ''; S.level = homeworkOnly ? '' : level;
+    MODES.last = homeworkOnly ? 'homework' : 'watch';
+    render();
   }
   function setRunMode(mode) {
     if (S.running || H.running) { render(); return; }
@@ -192,7 +205,7 @@
   }
   function selectStudyHomework(entries, now) {
     if (!FLOW.enabled || !H.running || !H.autoFlow) return false;
-    if (!homeworkApiReady()) { stopHomework('API 配置不可用，本轮继续观看视频。', 'warn'); return false; }
+    if (!homeworkApiReady()) { haltTasks('API 配置不可用，请检查后重新开始。'); return true; }
     const next = entries.find(entry => !entry.done && !entry.locked && (entry.isVideo
       ? !S.confirmed.has(entry.key) : entry.isHomework && !H.confirmed.has(entry.key) && !H.deferred.has(entry.key)));
     if (!next) {
@@ -258,6 +271,19 @@
   }
   function homeworkButtons(doc, pattern) {
     return [...doc.querySelectorAll('button')].filter(el => displayed(el) && pattern.test(normalized(el.textContent)));
+  }
+  function humanVerificationVisible(doc) {
+    const widgets = 'iframe[src*="captcha"],iframe[src*="geetest"],iframe[src*="yidun"],#tcaptcha_transform_dy,.tcaptcha-transform,.geetest_panel,.geetest_popup,.yidun_popup,.yidun_modal,.nc-container,.captcha-container,.captcha-modal,[data-captcha]';
+    if ([...doc.querySelectorAll(widgets)].some(displayed)) return true;
+    const layers = doc.querySelectorAll('[role=dialog],.el-dialog__wrapper,.el-message-box__wrapper,.modal-dialog,.captcha-popup');
+    return [...layers].some(el => displayed(el) && /人机验证|验证码|安全验证|行为验证|滑块验证|安全检测|验证身份|拖动.{0,12}滑块|请.{0,12}完成.{0,6}验证/.test(normalized(el.textContent)));
+  }
+  function pauseForVerification() {
+    if (!S.running && !H.running) return false;
+    const doc = homeworkDocument();
+    if (!humanVerificationVisible(document) && (!doc || !humanVerificationVisible(doc))) return false;
+    haltTasks('检测到人机验证，请手动完成验证后重新开始。');
+    return true;
   }
   function homeworkCards(doc) { return [...doc.querySelectorAll('.J_order[data-order]')]; }
   function cardSubmitted(card) { return Boolean(card?.querySelector('.status-container .icon-status')); }
@@ -518,11 +544,8 @@
     const image = await captureQuestion(q);
     assertHomework(token, q.root.ownerDocument, q.signature);
     const payload = buildQuestionPayload(q, image);
-    for (let attempt = 0; ; attempt++) {
-      assertHomework(token, q.root.ownerDocument, q.signature);
-      try { return validateAnswer(await requestModel(payload, token), q); }
-      catch (error) { if (!error.retryable || attempt >= 1 || !homeworkAlive(token)) throw error; tellHomework('模型接口繁忙，稍后重试一次…'); await waitHomework(4000); }
-    }
+    assertHomework(token, q.root.ownerDocument, q.signature);
+    return validateAnswer(await requestModel(payload, token), q);
   }
   function optionSelected(option) {
     return typeof option.input?.checked === 'boolean' ? option.input.checked
@@ -595,11 +618,12 @@
     return [...doc.querySelectorAll('.el-dialog__wrapper,.el-message-box__wrapper,[role=dialog]')].filter(displayed);
   }
   function confirmHomeworkSubmission(doc) {
+    if (pauseForVerification()) return true;
     const dialogs = blockedHomeworkDialog(doc);
     if (!dialogs.length) return false;
     const dialog = dialogs[0]; const text = normalized(dialog.textContent);
     const confirm = [...dialog.querySelectorAll('button')].find(el => displayed(el) && !el.disabled && /^(确定|确认提交|提交)$/.test(normalized(el.textContent)));
-    if (/提交/.test(text) && !/未作答|未完成|未答|验证码|考试|支付/.test(text) && confirm && !H.confirmClicked) { H.confirmClicked = true; confirm.click(); return true; }
+    if (/提交/.test(text) && !/未作答|未完成|未答|验证码|人机验证|安全验证|行为验证|滑块|考试|支付/.test(text) && confirm && !H.confirmClicked) { H.confirmClicked = true; confirm.click(); return true; }
     stopHomework('提交出现需人工处理的确认窗口，已暂停。', 'warn'); return true;
   }
   async function homeworkStep() {
@@ -1012,9 +1036,9 @@
       } else if (error.name === 'NotAllowedError' || error.name === 'TimeoutError') {
         S.needGesture = true;
       } else if (error.name !== 'AbortError') {
-        tell(`播放暂未恢复：${error.message || error.name}`, 'warn');
+        stop(`播放失败：${error.message || error.name}，请处理后重新开始。`, 'warn');
       }
-      if (S.needGesture) tell('播放器尚未开始播放。请恢复窗口并点击视频播放按钮，或先暂停助手再点击“开始”。', 'warn');
+      if (S.needGesture) stop('播放器尚未开始播放。请恢复窗口并点击视频播放按钮，或先暂停助手再点击“开始”。', 'warn');
     } finally { S.playing = false; }
   }
 
@@ -1057,6 +1081,7 @@
       S.confirmed.clear();
     }
     mount();
+    if (pauseForVerification()) return;
     if (activeMode() === 'homework') {
       const token = H.generation;
       void homeworkStep().catch(error => { if (homeworkAlive(token)) stopHomework(error.message || '作业处理失败。', 'warn'); });
@@ -1174,6 +1199,7 @@
   }
 
   function stop(message = '已暂停观看。', level = '') {
+    if (level === 'warn' || H.running && H.autoFlow) { haltTasks(message, level); return; }
     const wasRunning = S.running;
     pauseStudyWatching();
     S.running = false;
